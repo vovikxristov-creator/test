@@ -1,0 +1,592 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sales Lead Tracker - CRM</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@0.395.0/dist/umd/lucide.min.js"></script>
+    
+    <style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        .spinner {
+            border-top-color: #3b82f6;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        /* Custom styles for disabled inputs in table edit mode */
+        td input:disabled, td select:disabled {
+            background-color: #f3f4f6;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        // --- CONSTANTS ---
+        const MANAGERS_LIST = ['Саркаров Тимур', 'Намазов Замир', 'Утебаев Валерий', 'Гаврилов Владимир'];
+        const SOURCES_LIST = ['ТГ АИ', 'ТГ рассылка', 'ТГ бот', 'ЯД', 'Сайт', 'Входящий звонок', 'КЦ Лиды', 'От Максима', 'Другое'];
+        const KPI_SCORES = {
+            'ТГ АИ': 1, 'ТГ рассылка': 1, 'ТГ бот': 0.5, 'ЯД': 0.5,
+            'Сайт': 0.5, 'Входящий звонок': 0.5, 'КЦ Лиды': 1, 'От Максима': 0.5,
+        };
+        const STATUSES = {
+            'New': 'Новый', 'Contacted': 'Связались', 'Qualified': 'Квалифицирован',
+            'Proposal Sent': 'Отправлено КП', 'Won': 'Выигран', 'Lost': 'Проигран',
+        };
+        const STATUS_COLORS = {
+            'New': 'bg-blue-100 text-blue-800', 'Contacted': 'bg-yellow-100 text-yellow-800',
+            'Qualified': 'bg-purple-100 text-purple-800', 'Proposal Sent': 'bg-indigo-100 text-indigo-800',
+            'Won': 'bg-green-100 text-green-800', 'Lost': 'bg-red-100 text-red-800',
+        };
+        const PERIOD_OPTIONS = ['all', 'week', 'month', 'quarter', 'year'];
+        const PERIOD_NAMES = {
+            'all': 'Все время', 'week': 'Неделя', 'month': 'Месяц',
+            'quarter': 'Квартал', 'year': 'Год'
+        };
+
+        // --- STORAGE SERVICE (communicates with code.gs) ---
+        const storageService = {
+            getAllLeads() {
+                return new Promise((resolve, reject) => {
+                    google.script.run
+                        .withSuccessHandler(response => {
+                            if (response && response.error) {
+                                reject(new Error(response.error));
+                            } else {
+                                resolve(response || []);
+                            }
+                        })
+                        .withFailureHandler(error => reject(error))
+                        .getAllLeads();
+                });
+            },
+            addLead(lead) {
+                return new Promise((resolve, reject) => {
+                    google.script.run
+                        .withSuccessHandler(response => {
+                            if (response && response.error) {
+                                resolve({ success: false, error: response.error });
+                            } else {
+                                resolve({ success: true, data: response });
+                            }
+                        })
+                        .withFailureHandler(error => reject(error))
+                        .addLead(lead);
+                });
+            },
+            updateLead(updatedData) {
+                return new Promise((resolve, reject) => {
+                    google.script.run
+                        .withSuccessHandler(response => {
+                            if (response && response.error) {
+                                resolve({ success: false, error: response.error });
+                            } else {
+                                resolve({ success: true, data: response });
+                            }
+                        })
+                        .withFailureHandler(error => reject(error))
+                        .updateLead(updatedData);
+                });
+            },
+            deleteLead(id) {
+                return new Promise((resolve, reject) => {
+                    google.script.run
+                        .withSuccessHandler(response => {
+                            if (response && response.error) {
+                                resolve({ success: false, error: response.error });
+                            } else {
+                                resolve({ success: true });
+                            }
+                        })
+                        .withFailureHandler(error => reject(error))
+                        .deleteLead(id);
+                });
+            },
+        };
+
+        // --- UTILS ---
+        const formatCurrency = (amount) => new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 0 }).format(amount || 0);
+        const formatDate = (dateString) => dateString ? new Date(dateString).toLocaleDateString('ru-RU') : '';
+        
+        // --- GLOBAL STATE ---
+        let state = {
+            currentManager: null,
+            leads: [],
+            isLoading: true,
+            showForm: false,
+            message: null,
+            period: 'month',
+            managerFilter: 'all',
+            editingLeadId: null,
+            editingFormData: null,
+        };
+
+        // --- RENDER FUNCTIONS ---
+        const root = document.getElementById('root');
+
+        function render() {
+            let content = '';
+            if (!state.currentManager) {
+                content = renderLoginScreen();
+            } else if (state.isLoading) {
+                content = renderLoadingSpinner('Загрузка данных из Google Sheets...');
+            } else {
+                content = renderAppView();
+            }
+            
+            // Modals should be appended to the body to ensure they are on top
+            const modals = document.createElement('div');
+            if (state.showForm) {
+                modals.innerHTML += renderLeadForm();
+            }
+            if (state.message) {
+                modals.innerHTML += renderMessageBox(state.message);
+            }
+            root.innerHTML = content + modals.innerHTML;
+            lucide.createIcons();
+        }
+
+        function setState(newState) {
+            state = { ...state, ...newState };
+            render();
+        }
+
+        const renderLoadingSpinner = (text = 'Загрузка...') => `
+            <div class="flex items-center justify-center p-4 min-h-screen">
+                <div class="spinner w-6 h-6 border-4 rounded-full border-gray-200 border-t-blue-600"></div>
+                <span class="ml-2 text-gray-600">${text}</span>
+            </div>`;
+
+        const renderMessageBox = ({ text, type }) => {
+             const colors = {
+                info: 'border-blue-500 text-blue-800', error: 'border-red-500 text-red-800', success: 'border-green-500 text-green-800'
+            };
+            const icon = type === 'success' ? 'CheckCircle' : 'AlertCircle';
+            const buttonColor = {
+                error: 'bg-red-600 hover:bg-red-700', success: 'bg-green-600 hover:bg-green-700', info: 'bg-blue-600 hover:bg-blue-700'
+            };
+            return `
+                <div class="fixed inset-0 flex items-center justify-center p-4 bg-black bg-opacity-50 z-50" onclick="window.app.closeMessage()">
+                    <div class="bg-white p-6 rounded-lg shadow-2xl max-w-sm w-full border-t-4 ${colors[type]}" onclick="event.stopPropagation()">
+                        <div class="flex justify-between items-start">
+                            <div class="flex items-center">
+                                <div class="mr-3"><i data-lucide="${icon}" class="${type === 'success' ? 'text-green-500' : 'text-red-500'}"></i></div>
+                                <p class="font-semibold whitespace-pre-wrap">${text}</p>
+                            </div>
+                            <button onclick="window.app.closeMessage()" class="text-gray-400 hover:text-gray-600"><i data-lucide="X" class="w-5 h-5"></i></button>
+                        </div>
+                        <div class="mt-4 text-right">
+                            <button onclick="window.app.closeMessage()" class="px-4 py-2 text-white rounded-md text-sm font-medium ${buttonColor[type]}">OK</button>
+                        </div>
+                    </div>
+                </div>`;
+        };
+
+        const renderLoginScreen = () => `
+            <div class="min-h-screen bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center p-4">
+                <div class="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full">
+                    <div class="text-center mb-8">
+                        <div class="bg-blue-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4"><i data-lucide="Database" class="w-10 h-10 text-blue-600"></i></div>
+                        <h1 class="text-3xl font-bold text-gray-800 mb-2">Sales Lead Tracker</h1>
+                        <p class="text-gray-600">Облачная CRM с синхронизацией</p>
+                    </div>
+                    <div>
+                        <div class="mb-6">
+                            <label class="block text-gray-700 text-sm font-bold mb-2">Выберите ваше имя</label>
+                            <select id="manager-select" class="w-full shadow border rounded-lg py-3 px-4 text-gray-700 focus:outline-none focus:border-blue-500 bg-white">
+                                <option value="">-- Выберите менеджера --</option>
+                                ${MANAGERS_LIST.map(m => `<option value="${m}">${m}</option>`).join('')}
+                            </select>
+                        </div>
+                        <button onclick="window.app.handleLogin()" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-lg transition">Войти в систему</button>
+                    </div>
+                    <div class="mt-6 p-4 bg-green-50 rounded-lg border border-green-200">
+                        <p class="text-sm text-green-800 flex items-center"><i data-lucide="CheckCircle" class="w-4 h-4 mr-2"></i>Данные синхронизируются с Google Sheets</p>
+                    </div>
+                </div>
+            </div>`;
+
+        const renderLeadForm = () => {
+            const lead = { 
+                name: '', email: '', phone: '', manager: state.currentManager,
+                source: SOURCES_LIST[0], status: 'New', value: 0, sourceDescription: '',
+                kpi: KPI_SCORES[SOURCES_LIST[0]] || 0
+            };
+            return `
+            <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-40 overflow-y-auto" onclick="window.app.closeForm()">
+                <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6 relative my-8" onclick="event.stopPropagation()">
+                    <h3 class="text-2xl font-bold mb-6 text-gray-800">Добавить новый лид</h3>
+                    <button onclick="window.app.closeForm()" class="absolute top-4 right-4 text-gray-400 hover:text-gray-700"><i data-lucide="X" class="w-6 h-6"></i></button>
+                    <form id="lead-form" onsubmit="window.app.handleAddLead(event)">
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Имя <span class="text-red-500">*</span></label>
+                                <input name="name" class="shadow border rounded w-full py-2 px-3" required>
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Email</label>
+                                <input type="email" name="email" class="shadow border rounded w-full py-2 px-3">
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Телефон</label>
+                                <input name="phone" class="shadow border rounded w-full py-2 px-3">
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Стоимость сделки (RUB)</label>
+                                <input type="number" name="value" value="0" min="0" class="shadow border rounded w-full py-2 px-3">
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Менеджер</label>
+                                <select name="manager" class="shadow border rounded w-full py-2 px-3 bg-white">
+                                    ${MANAGERS_LIST.map(m => `<option value="${m}" ${m === state.currentManager ? 'selected' : ''}>${m}</option>`).join('')}
+                                </select>
+                            </div>
+                             <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Источник</label>
+                                <select name="source" class="shadow border rounded w-full py-2 px-3 bg-white" onchange="window.app.handleSourceChange(this)">
+                                    ${SOURCES_LIST.map(s => `<option value="${s}">${s}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div id="source-description-container" class="hidden">
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Описание источника <span class="text-red-500">*</span></label>
+                                <input name="sourceDescription" class="shadow border rounded w-full py-2 px-3">
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Баллы KPI</label>
+                                <input type="number" name="kpi" value="${lead.kpi}" class="shadow border rounded w-full py-2 px-3 bg-gray-100" readonly>
+                            </div>
+                             <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">Статус</label>
+                                <select name="status" class="shadow border rounded w-full py-2 px-3 bg-white">
+                                    ${Object.keys(STATUSES).map(s => `<option value="${s}">${STATUSES[s]}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div class="flex justify-end space-x-4 mt-6">
+                                <button type="button" onclick="window.app.closeForm()" class="bg-gray-200 text-gray-800 font-medium py-2 px-4 rounded-lg hover:bg-gray-300">Отмена</button>
+                                <button type="submit" class="bg-blue-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-blue-700">Сохранить лид</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>`;
+        };
+
+        const renderStatsCards = (stats, kpiTotal) => {
+            const data = [
+                { title: 'Новые лиды', value: stats.newLeads, icon: 'Plus', color: 'bg-blue-50' },
+                { title: 'Выиграно', value: formatCurrency(stats.wonValue), icon: 'CheckCircle', color: 'bg-green-50' },
+                { title: 'Общие баллы KPI', value: kpiTotal, icon: 'TrendingUp', color: 'bg-purple-50' },
+                { title: 'Конверсия', value: `${stats.conversionRate}%`, icon: 'RefreshCw', color: 'bg-indigo-50' },
+            ];
+            return `
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                ${data.map(item => `
+                    <div class="p-5 rounded-xl ${item.color} flex items-center space-x-4 border border-gray-200 shadow-sm">
+                        <div class="p-3 rounded-full bg-white shadow-md"><i data-lucide="${item.icon}" class="w-6 h-6 text-blue-500"></i></div>
+                        <div>
+                            <p class="text-sm font-medium text-gray-500">${item.title}</p>
+                            <p class="text-2xl font-bold text-gray-900 mt-1">${item.value}</p>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>`;
+        };
+        
+        const renderLeadsTable = (leads) => {
+            if (leads.length === 0) {
+                return `<div class="bg-white p-6 rounded-xl shadow-lg mb-8"><h2 class="text-xl font-semibold text-gray-800 mb-4">Все лиды</h2><p class="text-center py-6 text-gray-500">Список лидов пуст. Добавьте первый лид!</p></div>`;
+            }
+
+            const header = ['Имя', 'Email', 'Телефон', 'Менеджер', 'Источник', 'Статус', 'Стоимость', 'KPI', 'Дата', 'Действия'];
+            return `
+            <div class="bg-white p-6 rounded-xl shadow-lg mb-8">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4">Все лиды (${leads.length})</h2>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>${header.map(h => `<th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">${h}</th>`).join('')}</tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            ${leads.map(lead => state.editingLeadId === lead.id ? renderEditRow(lead) : renderViewRow(lead)).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+        };
+
+        const renderViewRow = (lead) => `
+            <tr id="lead-${lead.id}" class="hover:bg-gray-50">
+                <td class="px-3 py-3 text-sm font-medium">${lead.name || ''}</td>
+                <td class="px-3 py-3 text-sm">${lead.email || ''}</td>
+                <td class="px-3 py-3 text-sm">${lead.phone || ''}</td>
+                <td class="px-3 py-3 text-sm">${lead.manager || ''}</td>
+                <td class="px-3 py-3 text-sm">${(lead.source === 'Другое' ? lead.sourceDescription : lead.source) || ''}</td>
+                <td class="px-3 py-3 text-sm"><span class="px-3 py-1 text-sm font-semibold rounded-full ${STATUS_COLORS[lead.status] || ''}">${STATUSES[lead.status] || ''}</span></td>
+                <td class="px-3 py-3 text-sm">${formatCurrency(lead.value)}</td>
+                <td class="px-3 py-3 text-sm font-semibold text-purple-700">${lead.kpi || 0}</td>
+                <td class="px-3 py-3 text-sm text-gray-500">${formatDate(lead.createdAt)}</td>
+                <td class="px-3 py-3 text-sm whitespace-nowrap">
+                    <div class="flex space-x-2">
+                        <button onclick='window.app.startEdit(JSON.stringify(${JSON.stringify(lead)}))' class="text-indigo-600 hover:text-indigo-800 font-medium text-xs">Изменить</button>
+                        <button onclick="window.app.handleDeleteLead('${lead.id}')" class="text-red-600 hover:text-red-800"><i data-lucide="Trash2" class="w-4 h-4"></i></button>
+                    </div>
+                </td>
+            </tr>`;
+
+        const renderEditRow = (lead) => {
+            const formData = state.editingFormData;
+            return `
+            <tr id="edit-lead-${formData.id}" class="bg-blue-50">
+                <td class="px-3 py-3"><input name="name" class="border rounded px-2 py-1 w-full" value="${formData.name || ''}"></td>
+                <td class="px-3 py-3"><input name="email" class="border rounded px-2 py-1 w-full" value="${formData.email || ''}"></td>
+                <td class="px-3 py-3"><input name="phone" class="border rounded px-2 py-1 w-full" value="${formData.phone || ''}"></td>
+                <td class="px-3 py-3"><select name="manager" class="border rounded px-2 py-1 w-full bg-white">${MANAGERS_LIST.map(m => `<option value="${m}" ${formData.manager === m ? 'selected' : ''}>${m}</option>`).join('')}</select></td>
+                <td class="px-3 py-3">
+                    <select name="source" class="border rounded px-2 py-1 w-full bg-white" onchange="window.app.handleEditSourceChange(this)">
+                        ${SOURCES_LIST.map(s => `<option value="${s}" ${formData.source === s ? 'selected' : ''}>${s}</option>`).join('')}
+                    </select>
+                     ${formData.source === 'Другое' ? `<input name="sourceDescription" class="border rounded px-2 py-1 w-full mt-1" placeholder="Описание" value="${formData.sourceDescription || ''}">` : ''}
+                </td>
+                <td class="px-3 py-3"><select name="status" class="border rounded px-2 py-1 w-full bg-white">${Object.keys(STATUSES).map(s => `<option value="${s}" ${formData.status === s ? 'selected' : ''}>${STATUSES[s]}</option>`).join('')}</select></td>
+                <td class="px-3 py-3"><input type="number" name="value" class="border rounded px-2 py-1 w-full" value="${formData.value || 0}"></td>
+                <td class="px-3 py-3"><input type="number" name="kpi" class="border rounded px-2 py-1 w-20" value="${formData.kpi || 0}" ${formData.source !== 'Другое' ? 'disabled' : ''}></td>
+                <td class="px-3 py-3 text-sm text-gray-500">${formatDate(formData.createdAt)}</td>
+                <td class="px-3 py-3 text-sm whitespace-nowrap">
+                    <div class="flex space-x-2">
+                        <button onclick="window.app.handleSaveLead('${formData.id}')" class="text-blue-600 hover:text-blue-800 font-medium text-xs">Сохранить</button>
+                        <button onclick="window.app.cancelEdit()" class="text-gray-500 hover:text-gray-700 text-xs">Отмена</button>
+                    </div>
+                </td>
+            </tr>`;
+        }
+
+        const renderAppView = () => {
+            const filteredLeads = state.leads.filter(lead => {
+                const now = new Date();
+                const createdDate = new Date(lead.createdAt);
+                const diffDays = (now - createdDate) / (1000 * 60 * 60 * 24);
+                
+                let periodMatch = true;
+                if (state.period === 'week') periodMatch = diffDays <= 7;
+                else if (state.period === 'month') periodMatch = diffDays <= 30;
+                else if (state.period === 'quarter') periodMatch = diffDays <= 90;
+                else if (state.period === 'year') periodMatch = diffDays <= 365;
+
+                const managerMatch = state.managerFilter === 'all' || lead.manager === state.managerFilter;
+                return periodMatch && managerMatch;
+            });
+            
+            const wonLeads = filteredLeads.filter(l => l.status === 'Won');
+            const stats = {
+                newLeads: filteredLeads.length,
+                wonValue: wonLeads.reduce((sum, l) => sum + (l.value || 0), 0),
+                conversionRate: filteredLeads.length > 0 ? Math.round((wonLeads.length / filteredLeads.length) * 100) : 0,
+            };
+            const kpiTotal = state.leads.reduce((sum, l) => sum + (Number(l.kpi) || 0), 0);
+            
+            return `
+            <div class="min-h-screen bg-gray-100 p-4 md:p-8">
+                <header class="mb-8 flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
+                    <div>
+                        <h1 class="text-4xl font-bold text-gray-800">Sales Lead Tracker</h1>
+                        <p class="text-gray-600 mt-1 flex items-center"><i data-lucide="User" class="w-4 h-4 inline mr-1"></i>${state.currentManager}</p>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                        <button onclick="window.app.loadData()" class="bg-white border text-gray-700 font-medium py-2 px-4 rounded-lg hover:bg-gray-100 flex items-center"><i data-lucide="RefreshCw" class="w-5 h-5 mr-2"></i>Обновить</button>
+                        <button onclick="setState({ showForm: true })" class="bg-blue-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-blue-700 shadow-md flex items-center"><i data-lucide="Plus" class="w-5 h-5 mr-2"></i>Добавить лид</button>
+                        <button onclick="window.app.handleLogout()" class="bg-red-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-red-700 flex items-center"><i data-lucide="LogOut" class="w-5 h-5 mr-2"></i>Выход</button>
+                    </div>
+                </header>
+                <div class="flex flex-col md:flex-row items-center justify-between mb-6 space-y-4 md:space-y-0">
+                    <div class="flex space-x-2 flex-wrap gap-2">
+                        ${PERIOD_OPTIONS.map(p => `
+                            <button onclick="setState({ period: '${p}' })" class="px-4 py-2 text-sm font-medium rounded-lg transition ${state.period === p ? 'bg-blue-600 text-white shadow-md' : 'bg-white text-gray-700 border'}">${PERIOD_NAMES[p]}</button>
+                        `).join('')}
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <i data-lucide="Filter" class="w-5 h-5 text-gray-600"></i>
+                        <select onchange="setState({ managerFilter: this.value })" class="shadow border rounded py-2 px-3 bg-white">
+                            <option value="all" ${state.managerFilter === 'all' ? 'selected' : ''}>Все менеджеры</option>
+                            ${MANAGERS_LIST.map(m => `<option value="${m}" ${state.managerFilter === m ? 'selected' : ''}>${m}</option>`).join('')}
+                        </select>
+                    </div>
+                </div>
+                ${renderStatsCards(stats, kpiTotal)}
+                ${renderLeadsTable(filteredLeads)}
+            </div>`;
+        };
+        
+        // --- EVENT HANDLERS & APP LOGIC ---
+        const app = {
+            async init() {
+                setState({ isLoading: true });
+                const savedManager = sessionStorage.getItem('currentManager');
+                if (savedManager && MANAGERS_LIST.includes(savedManager)) {
+                    state.currentManager = savedManager;
+                    await this.loadData();
+                } else {
+                    setState({ isLoading: false, currentManager: null });
+                }
+            },
+            async loadData() {
+                setState({ isLoading: true });
+                try {
+                    const data = await storageService.getAllLeads();
+                    setState({ leads: data, isLoading: false });
+                } catch(error) {
+                    setState({ isLoading: false, message: { text: 'Ошибка загрузки данных: ' + error.message, type: 'error' }});
+                }
+            },
+            handleLogin() {
+                const manager = document.getElementById('manager-select').value;
+                if (manager) {
+                    sessionStorage.setItem('currentManager', manager);
+                    setState({ currentManager: manager });
+                    this.loadData();
+                }
+            },
+            handleLogout() {
+                sessionStorage.removeItem('currentManager');
+                setState({ currentManager: null, leads: [] });
+            },
+            closeMessage() {
+                setState({ message: null });
+            },
+            closeForm() {
+                setState({ showForm: false });
+            },
+            async handleAddLead(event) {
+                event.preventDefault();
+                const formData = new FormData(event.target);
+                const leadData = Object.fromEntries(formData.entries());
+                
+                if (leadData.source === 'Другое' && !leadData.sourceDescription) {
+                    alert("Поле 'Описание источника' обязательно для 'Другое'"); return;
+                }
+                const isDuplicate = state.leads.some(l => 
+                    (leadData.email && l.email && l.email.toLowerCase() === leadData.email.toLowerCase()) ||
+                    (leadData.phone && l.phone && l.phone.replace(/\D/g, '') === leadData.phone.replace(/\D/g, ''))
+                );
+                if (isDuplicate) {
+                    setState({ message: { text: 'Дубликат! Лид с таким email или телефоном уже существует.', type: 'error' }});
+                    return;
+                }
+
+                leadData.value = parseFloat(leadData.value) || 0;
+                leadData.kpi = parseFloat(leadData.kpi) || 0;
+
+                const result = await storageService.addLead(leadData);
+                if (result.success) {
+                    setState({ 
+                        leads: [result.data, ...state.leads], 
+                        showForm: false, 
+                        message: { text: 'Лид успешно добавлен!', type: 'success' }
+                    });
+                } else {
+                    setState({ message: { text: result.error, type: 'error' } });
+                }
+            },
+            async handleDeleteLead(id) {
+                if (!confirm('Вы уверены, что хотите удалить этот лид?')) return;
+                const result = await storageService.deleteLead(id);
+                 if (result.success) {
+                    setState({ 
+                        leads: state.leads.filter(l => l.id !== id),
+                        message: { text: 'Лид удален.', type: 'success' }
+                    });
+                } else {
+                    setState({ message: { text: result.error, type: 'error' } });
+                }
+            },
+            startEdit(leadString) {
+                const lead = JSON.parse(leadString);
+                setState({ editingLeadId: lead.id, editingFormData: { ...lead } });
+            },
+            cancelEdit() {
+                setState({ editingLeadId: null, editingFormData: null });
+            },
+            async handleSaveLead(id) {
+                const formRow = document.getElementById(`edit-lead-${id}`);
+                const inputs = formRow.querySelectorAll('input, select');
+                let updatedData = { ...state.editingFormData };
+                inputs.forEach(input => {
+                    updatedData[input.name] = input.type === 'number' ? parseFloat(input.value) || 0 : input.value;
+                });
+
+                if (updatedData.source === 'Другое' && !updatedData.sourceDescription) {
+                    alert("Поле 'Описание источника' обязательно для 'Другое'"); return;
+                }
+
+                const result = await storageService.updateLead(updatedData);
+                if (result.success) {
+                    setState({ 
+                        leads: state.leads.map(l => l.id === id ? result.data : l),
+                        editingLeadId: null,
+                        editingFormData: null,
+                        message: { text: 'Лид обновлен.', type: 'success' }
+                    });
+                } else {
+                     setState({ message: { text: result.error, type: 'error' } });
+                }
+            },
+            handleSourceChange(selectElement) {
+                const form = selectElement.closest('form');
+                const source = selectElement.value;
+                const descContainer = form.querySelector('#source-description-container');
+                const kpiInput = form.querySelector('input[name="kpi"]');
+                if (source === 'Другое') {
+                    descContainer.classList.remove('hidden');
+                    descContainer.querySelector('input').required = true;
+                    kpiInput.value = 0;
+                    kpiInput.readOnly = false;
+                    kpiInput.classList.remove('bg-gray-100');
+                } else {
+                    descContainer.classList.add('hidden');
+                    descContainer.querySelector('input').required = false;
+                    kpiInput.value = KPI_SCORES[source] || 0;
+                    kpiInput.readOnly = true;
+                    kpiInput.classList.add('bg-gray-100');
+                }
+            },
+            handleEditSourceChange(selectElement) {
+                const source = selectElement.value;
+                const kpi = source === 'Другое' ? state.editingFormData.kpi : (KPI_SCORES[source] || 0);
+                const newFormData = { ...state.editingFormData, source, kpi };
+
+                // Re-render just the row with updated data
+                const oldRow = document.getElementById(`edit-lead-${newFormData.id}`);
+                if (oldRow) {
+                    const tempDiv = document.createElement('div');
+                    tempDiv.innerHTML = `<table>${renderEditRow({editingFormData: newFormData})}</table>`;
+                    const newRow = tempDiv.querySelector('tr');
+                    oldRow.parentElement.replaceChild(newRow, oldRow);
+                    lucide.createIcons();
+                }
+                
+                state.editingFormData = newFormData; // Update state without full re-render
+            }
+        };
+
+        // Expose app to global scope for inline event handlers
+        window.app = app;
+        window.setState = setState; // Helper for buttons
+
+        // Initial Load
+        app.init();
+    </script>
+</body>
+</html>

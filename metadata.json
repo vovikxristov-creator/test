@@ -1,0 +1,5 @@
+{
+  "name": "Sales Lead Tracker CRM 1.2 (Vanilla JS)",
+  "description": "A single-file, cloud-synchronized CRM built with vanilla JavaScript to track and manage sales leads, calculate KPI scores, and view performance statistics for sales managers.",
+  "requestFramePermissions": []
+}
